@@ -3,4 +3,4 @@ node_modules/
 *.sqlite
 *.sqlite3
 *.log
-.env
+.env.env 
