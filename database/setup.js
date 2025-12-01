@@ -3,9 +3,9 @@ require('dotenv').config();
 
 // Initialize database connection
 const db = new Sequelize({
-    dialect: 'sqlite',  // explicitly set dialect
+    dialect: 'sqlite',
     storage: process.env.DB_NAME ? `database/${process.env.DB_NAME}` : 'database/tasks.db',
-    logging: false       // optional: suppress SQL logs
+    logging: false
 });
 
 // ----------------- MODELS -----------------
@@ -15,8 +15,13 @@ const User = db.define('User', {
     id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
     name: { type: DataTypes.STRING, allowNull: false },
     email: { type: DataTypes.STRING, allowNull: false, unique: true },
-    password: { type: DataTypes.STRING, allowNull: false }
-    // TODO: add role field if needed
+    password: { type: DataTypes.STRING, allowNull: false },
+    role: {                          // <-- Added role
+        type: DataTypes.STRING,
+        allowNull: false,
+        defaultValue: 'employee',
+        validate: { isIn: [['employee', 'manager', 'admin']] }
+    }
 });
 
 // Project Model

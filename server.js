@@ -1,163 +1,191 @@
 const express = require('express');
-const cors = require('cors');
-const session = require('express-session');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 const { db, User, Project, Task } = require('./database/setup');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ----------------- MIDDLEWARE -----------------
 app.use(express.json());
-app.use(cors());
 
-app.use(session({
-    secret: process.env.SESSION_SECRET || 'defaultsecret',
-    resave: false,
-    saveUninitialized: false,
-    cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
-}));
-
-// ----------------- AUTH MIDDLEWARE -----------------
-function requireAuth(req, res, next) {
-    if (req.session && req.session.userId) {
-        req.user = {
-            id: req.session.userId,
-            name: req.session.userName,
-            email: req.session.userEmail
-        };
+// ----------------- JWT AUTH -----------------
+function authenticateJWT(req, res, next) {
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith("Bearer ")) {
+        return res.status(401).json({ error: "Missing or invalid token" });
+    }
+    const token = header.split(" ")[1];
+    try {
+        const decoded = jwt.verify(token, process.env.JWT_SECRET);
+        req.user = decoded; // decoded contains id, name, email, role
         next();
-    } else {
-        res.status(401).json({ error: 'Authentication required' });
+    } catch (err) {
+        return res.status(401).json({ error: "Invalid or expired token" });
     }
 }
 
-// ----------------- HEALTH CHECK -----------------
-app.get('/api/health', (req, res) => {
-    res.json({ status: 'API running', env: process.env.NODE_ENV || 'development' });
-});
+// ----------------- ROLE MIDDLEWARE -----------------
+function requireManager(req, res, next) {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (req.user.role === "manager" || req.user.role === "admin") return next();
+    return res.status(403).json({ error: "Managers or admins only" });
+}
+
+function requireAdmin(req, res, next) {
+    if (!req.user) return res.status(401).json({ error: "Unauthorized" });
+    if (req.user.role === "admin") return next();
+    return res.status(403).json({ error: "Admins only" });
+}
+
+// ----------------- TEST DATABASE CONNECTION -----------------
+async function testConnection() {
+    try {
+        await db.authenticate();
+        console.log("Database connected.");
+    } catch (err) {
+        console.error("Database connection error:", err);
+    }
+}
+testConnection();
 
 // ----------------- AUTH ROUTES -----------------
+
+// REGISTER
 app.post('/api/register', async (req, res) => {
     try {
-        const { name, email, password } = req.body;
-        const existingUser = await User.findOne({ where: { email } });
-        if (existingUser) return res.status(400).json({ error: 'User with this email already exists' });
+        const { name, email, password, role = "employee" } = req.body;
 
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const newUser = await User.create({ name, email, password: hashedPassword });
+        const exists = await User.findOne({ where: { email } });
+        if (exists) return res.status(400).json({ error: "Email already exists" });
 
-        res.status(201).json({ message: 'User registered', user: { id: newUser.id, name: newUser.name, email: newUser.email } });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to register user' });
+        const hashed = await bcrypt.hash(password, 10);
+
+        const newUser = await User.create({ name, email, password: hashed, role });
+
+        const token = jwt.sign(
+            { id: newUser.id, name, email, role },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN }
+        );
+
+        res.status(201).json({ message: "Registration successful", token, user: { id: newUser.id, name, email, role } });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "Registration failed" });
     }
 });
 
+// LOGIN
 app.post('/api/login', async (req, res) => {
     try {
         const { email, password } = req.body;
         const user = await User.findOne({ where: { email } });
-        if (!user) return res.status(401).json({ error: 'Invalid email or password' });
+        if (!user) return res.status(401).json({ error: "Invalid credentials" });
 
-        const validPassword = await bcrypt.compare(password, user.password);
-        if (!validPassword) return res.status(401).json({ error: 'Invalid email or password' });
+        const valid = await bcrypt.compare(password, user.password);
+        if (!valid) return res.status(401).json({ error: "Invalid credentials" });
 
-        req.session.userId = user.id;
-        req.session.userName = user.name;
-        req.session.userEmail = user.email;
+        const token = jwt.sign(
+            { id: user.id, name: user.name, email: user.email, role: user.role },
+            process.env.JWT_SECRET,
+            { expiresIn: process.env.JWT_EXPIRES_IN }
+        );
 
-        res.json({ message: 'Login successful', user: { id: user.id, name: user.name, email: user.email } });
-    } catch (error) {
-        console.error(error);
-        res.status(500).json({ error: 'Failed to login' });
+        res.json({ message: "Login successful", token, user: { id: user.id, name: user.name, email: user.email, role: user.role } });
+    } catch (err) {
+        res.status(500).json({ error: "Login failed" });
     }
 });
 
-app.post('/api/logout', (req, res) => {
-    req.session.destroy(err => {
-        if (err) return res.status(500).json({ error: 'Failed to logout' });
-        res.json({ message: 'Logout successful' });
-    });
-});
+// LOGOUT (stateless)
+app.post('/api/logout', (req, res) => res.json({ message: "Logout successful (JWT stateless)" }));
 
 // ----------------- USER ROUTES -----------------
-app.get('/api/users/profile', requireAuth, async (req, res) => {
-    const user = await User.findByPk(req.user.id, { attributes: ['id','name','email'] });
-    if (!user) return res.status(404).json({ error: 'User not found' });
+
+// PROFILE
+app.get('/api/users/profile', authenticateJWT, async (req, res) => {
+    const user = await User.findByPk(req.user.id, { attributes: ['id', 'name', 'email', 'role'] });
     res.json(user);
 });
 
-app.get('/api/users', requireAuth, async (req, res) => {
-    const users = await User.findAll({ attributes: ['id','name','email'] });
+// ADMIN: GET ALL USERS
+app.get('/api/users', authenticateJWT, requireAdmin, async (req, res) => {
+    const users = await User.findAll({ attributes: ['id', 'name', 'email', 'role'] });
     res.json(users);
 });
 
 // ----------------- PROJECT ROUTES -----------------
-app.get('/api/projects', requireAuth, async (req, res) => {
-    const projects = await Project.findAll({ include: [{ model: User, as: 'manager', attributes: ['id','name','email'] }] });
+
+// GET PROJECTS
+app.get('/api/projects', authenticateJWT, async (req, res) => {
+    const projects = await Project.findAll({ include: [{ model: User, as: 'manager', attributes: ['id', 'name', 'email'] }] });
     res.json(projects);
 });
 
-app.get('/api/projects/:id', requireAuth, async (req, res) => {
+// GET SINGLE PROJECT
+app.get('/api/projects/:id', authenticateJWT, async (req, res) => {
     const project = await Project.findByPk(req.params.id, {
         include: [
-            { model: User, as: 'manager', attributes: ['id','name','email'] },
-            { model: Task, include: [{ model: User, as: 'assignedUser', attributes: ['id','name','email'] }] }
+            { model: User, as: 'manager', attributes: ['id', 'name', 'email'] },
+            { model: Task, include: [{ model: User, as: 'assignedUser', attributes: ['id', 'name', 'email'] }] }
         ]
     });
-    if (!project) return res.status(404).json({ error: 'Project not found' });
+    if (!project) return res.status(404).json({ error: "Project not found" });
     res.json(project);
 });
 
-app.post('/api/projects', requireAuth, async (req, res) => {
-    const { name, description, status = 'active' } = req.body;
-    const newProject = await Project.create({ name, description, status, managerId: req.user.id });
-    res.status(201).json(newProject);
+// CREATE PROJECT (Manager+)
+app.post('/api/projects', authenticateJWT, requireManager, async (req, res) => {
+    const { name, description, status = "active" } = req.body;
+    const project = await Project.create({ name, description, status, managerId: req.user.id });
+    res.status(201).json(project);
 });
 
-app.put('/api/projects/:id', requireAuth, async (req, res) => {
-    const { name, description, status } = req.body;
-    const [updatedRows] = await Project.update({ name, description, status }, { where: { id: req.params.id } });
-    if (!updatedRows) return res.status(404).json({ error: 'Project not found' });
-    const updatedProject = await Project.findByPk(req.params.id);
-    res.json(updatedProject);
+// UPDATE PROJECT (Manager+)
+app.put('/api/projects/:id', authenticateJWT, requireManager, async (req, res) => {
+    const project = await Project.findByPk(req.params.id);
+    if (!project) return res.status(404).json({ error: "Project not found" });
+    await project.update(req.body);
+    res.json(project);
 });
 
-app.delete('/api/projects/:id', requireAuth, async (req, res) => {
-    const deletedRows = await Project.destroy({ where: { id: req.params.id } });
-    if (!deletedRows) return res.status(404).json({ error: 'Project not found' });
-    res.json({ message: 'Project deleted successfully' });
+// DELETE PROJECT (Admin)
+app.delete('/api/projects/:id', authenticateJWT, requireAdmin, async (req, res) => {
+    const deleted = await Project.destroy({ where: { id: req.params.id } });
+    if (!deleted) return res.status(404).json({ error: "Project not found" });
+    res.json({ message: "Project deleted" });
 });
 
 // ----------------- TASK ROUTES -----------------
-app.get('/api/projects/:id/tasks', requireAuth, async (req, res) => {
-    const tasks = await Task.findAll({ where: { projectId: req.params.id }, include: [{ model: User, as: 'assignedUser', attributes: ['id','name','email'] }] });
+
+// GET TASKS FOR PROJECT
+app.get('/api/projects/:id/tasks', authenticateJWT, async (req, res) => {
+    const tasks = await Task.findAll({ where: { projectId: req.params.id }, include: [{ model: User, as: 'assignedUser', attributes: ['id', 'name', 'email'] }] });
     res.json(tasks);
 });
 
-app.post('/api/projects/:id/tasks', requireAuth, async (req, res) => {
+// CREATE TASK (Manager+)
+app.post('/api/projects/:id/tasks', authenticateJWT, requireManager, async (req, res) => {
     const { title, description, assignedUserId, priority = 'medium' } = req.body;
-    const newTask = await Task.create({ title, description, projectId: req.params.id, assignedUserId, priority, status: 'pending' });
-    res.status(201).json(newTask);
+    const task = await Task.create({ title, description, projectId: req.params.id, assignedUserId, priority, status: 'pending' });
+    res.status(201).json(task);
 });
 
-app.put('/api/tasks/:id', requireAuth, async (req, res) => {
-    const { title, description, status, priority } = req.body;
-    const [updatedRows] = await Task.update({ title, description, status, priority }, { where: { id: req.params.id } });
-    if (!updatedRows) return res.status(404).json({ error: 'Task not found' });
-    const updatedTask = await Task.findByPk(req.params.id);
-    res.json(updatedTask);
+// UPDATE TASK (any user)
+app.put('/api/tasks/:id', authenticateJWT, async (req, res) => {
+    const task = await Task.findByPk(req.params.id);
+    if (!task) return res.status(404).json({ error: "Task not found" });
+    await task.update(req.body);
+    res.json(task);
 });
 
-app.delete('/api/tasks/:id', requireAuth, async (req, res) => {
-    const deletedRows = await Task.destroy({ where: { id: req.params.id } });
-    if (!deletedRows) return res.status(404).json({ error: 'Task not found' });
-    res.json({ message: 'Task deleted successfully' });
+// DELETE TASK (Manager+)
+app.delete('/api/tasks/:id', authenticateJWT, requireManager, async (req, res) => {
+    const deleted = await Task.destroy({ where: { id: req.params.id } });
+    if (!deleted) return res.status(404).json({ error: "Task not found" });
+    res.json({ message: "Task deleted" });
 });
 
 // ----------------- START SERVER -----------------
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Server running on http://0.0.0.0:${PORT}`);
-});
+app.listen(PORT, () => console.log('Server running at http://localhost:${PORT}'));
